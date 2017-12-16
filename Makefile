@@ -1,13 +1,19 @@
-DEPS := "wget git go docker"
+DEPS := "wget git go docker golint"
 
 BINARY := autospotting
 BINARY_PKG := ./core
+GOFILES := $(shell find . -type f -name '*.go' -not -path "./vendor/*")
 COVER_PROFILE := /tmp/coverage.out
 BUCKET_NAME ?= cloudprowess
-LOCAL_PATH := build/s3/dv
+FLAVOR ?= nightly
+LOCAL_PATH := build/s3/$(FLAVOR)
 
 SHA := $(shell git rev-parse HEAD | cut -c 1-7)
 BUILD := $(or $(TRAVIS_BUILD_NUMBER), $(TRAVIS_BUILD_NUMBER), $(SHA))
+EXPIRATION := $(shell ./expiration_date.sh $(FLAVOR))
+
+LDFLAGS="-pluginpath lambda -X lambda.Version=$(FLAVOR)-$(BUILD) -X lambda.ExpirationDate=$(EXPIRATION)"
+LOCAL_LDFLAGS="-X main.Version=$(FLAVOR)-$(BUILD) -X main.ExpirationDate=$(EXPIRATION)"
 
 all: fmt-check vet-check build_local test                    ## Build the code
 .PHONY: all
@@ -19,9 +25,8 @@ clean:                                                       ## Remove installed
 .PHONY: clean
 
 check_deps:                                                  ## Verify the system has all dependencies installed
-	@for DEP in $(shell echo "$(DEPS)"); do \
-		command -v "$$DEP" &>/dev/null \
-		|| (echo "Error: dependency '$$DEP' is absent" ; exit 1); \
+	@for DEP in "$(DEPS)"; do \
+		if ! command -v "$$DEP" >/dev/null ; then echo "Error: dependency '$$DEP' is absent" ; exit 1; fi; \
 	done
 	@echo "all dependencies satisifed: $(DEPS)"
 .PHONY: check_deps
@@ -29,12 +34,14 @@ check_deps:                                                  ## Verify the syste
 build_deps:
 	@go get ./...
 	@go get github.com/mattn/goveralls
+	@go get github.com/golang/lint/golint
 	@go get golang.org/x/tools/cmd/cover
 	@docker pull eawsy/aws-lambda-go-shim:latest
+	wget -O Makefile.lambda https://git.io/vytH8
 .PHONY: build_deps
 
 build_lambda_binary: build_deps                              ## Build lambda binary
-	BUILD_NUMBER=$(BUILD) make -f Makefile.lambda docker
+	LDFLAGS=$(LDFLAGS) make -f Makefile.lambda docker
 .PHONY: build_lambda_binary
 
 prepare_upload_data: build_lambda_binary                     ## Create archive to be uploaded
@@ -49,7 +56,7 @@ prepare_upload_data: build_lambda_binary                     ## Create archive t
 .PHONY: prepare_upload_data
 
 build_local:                                                 ## Build binary - local dev
-	go build -ldflags='-X main.Version=$(BUILD)' -o $(BINARY)
+	go build -ldflags=$(LOCAL_LDFLAGS) -o $(BINARY)
 .PHONY: build_local
 
 upload: prepare_upload_data                                  ## Upload binary
@@ -57,22 +64,18 @@ upload: prepare_upload_data                                  ## Upload binary
 .PHONY: upload
 
 vet-check:                                                   ## Verify vet compliance
-ifeq ($(shell go tool vet -all -shadow=true . 2>&1 | wc -l), 0)
+ifeq ($(shell go tool vet -all -shadow=true $(GOFILES) 2>&1 | wc -l), 0)
 	@printf "ok\tall files passed go vet\n"
 else
 	@printf "error\tsome files did not pass go vet\n"
-	@go tool vet -all -shadow=true . 2>&1
+	@go tool vet -all -shadow=true $(GOFILES) 2>&1
 endif
 .PHONY: vet-check
 
-fmt:
-	gofmt -l -s -w .
-.PHONY: fmt
-
 fmt-check:                                                   ## Verify fmt compliance
-ifneq ($(shell gofmt -l -s . | wc -l), 0)
+ifneq ($(shell gofmt -l -s $(GOFILES) | wc -l), 0)
 	@printf "error\tsome files did not pass go fmt, fix the following formatting diff or run 'make fmt'\n"
-	@gofmt -l -s -d .
+	@gofmt -l -s -d $(GOFILES)
 	@exit 1
 else
 	@printf "ok\tall files passed go fmt\n"
@@ -84,7 +87,8 @@ test:                                                        ## Test go code and
 .PHONY: test
 
 lint:
-	@golint -set_exit_status=1 ./...
+	@golint -set_exit_status $(BINARY_PKG)
+	@golint -set_exit_status .
 .PHONY: lint
 
 full-test: fmt-check vet-check test lint                     ## Pass test / fmt / vet / lint
@@ -94,14 +98,14 @@ html-cover: test                                             ## Display coverage
 	@go tool cover -html=$(COVER_PROFILE)
 .PHONY: html-cover
 
-travisci-cover: html-cover                                   ## Generate coverage in the TravisCI format, fails unless executed from TravisCI
+travisci-cover: html-cover                                   ## Test & generate coverage in the TravisCI format, fails unless executed from TravisCI
 	@goveralls -coverprofile=$(COVER_PROFILE) -service=travis-ci
 .PHONY: travisci-cover
 
-travisci-checks: fmt-check vet-check                         ## Pass fmt / vet and calculate test coverage
+travisci-checks: fmt-check vet-check lint                    ## Pass fmt / vet & lint format
 .PHONY: travisci-checks
 
-travisci: travisci-checks prepare_upload_data travisci-cover ## Executed by TravisCI
+travisci: prepare_upload_data travisci-checks travisci-cover ## Executed by TravisCI
 .PHONY: travisci
 
 help:                                                        ## Show this help
