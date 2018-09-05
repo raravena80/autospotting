@@ -2,12 +2,15 @@ package autospotting
 
 import (
 	"errors"
+	"math"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/autoscaling"
 	"github.com/aws/aws-sdk-go/service/ec2"
+	"github.com/davecgh/go-spew/spew"
 )
 
 func TestMake(t *testing.T) {
@@ -619,6 +622,11 @@ func TestIsVirtualizationCompatible(t *testing.T) {
 			instanceVirtualizationType: aws.String("hvm"),
 			expected:                   true,
 		},
+		{name: "Spot's virtualization does not include any type",
+			spotVirtualizationTypes:    []string{},
+			instanceVirtualizationType: aws.String("hvm"),
+			expected:                   true,
+		},
 		{name: "Spot's virtualization doesn't include instance's one (pv case)",
 			spotVirtualizationTypes:    []string{"HVM"},
 			instanceVirtualizationType: aws.String("paravirtual"),
@@ -644,110 +652,16 @@ func TestIsVirtualizationCompatible(t *testing.T) {
 	}
 }
 
-func TestIsQuantityCompatible(t *testing.T) {
-	tests := []struct {
-		name               string
-		asgName            string
-		asgInstances       instances
-		asgDesiredCapacity *int64
-		availabilityZone   *string
-		spotInfo           instanceTypeInformation
-		expected           bool
-	}{
-		{name: "ASG spot ratio is too low (already 1 for 4)",
-			asgName: "test-asg",
-			asgInstances: makeInstancesWithCatalog(
-				map[string]*instance{
-					"id-1": {
-						Instance: &ec2.Instance{
-							InstanceId:        aws.String("id-1"),
-							InstanceType:      aws.String("m3.medium"),
-							Placement:         &ec2.Placement{AvailabilityZone: aws.String("eu-west-1a")},
-							InstanceLifecycle: aws.String("spot"),
-						},
-					},
-				},
-			),
-			asgDesiredCapacity: aws.Int64(4),
-			spotInfo:           instanceTypeInformation{instanceType: "m3.medium"},
-			availabilityZone:   aws.String("eu-west-1a"),
-			expected:           false,
-		},
-		{name: "ASG spot ratio is high enough (only 1 for 10)",
-			asgName: "test-asg",
-			asgInstances: makeInstancesWithCatalog(
-				map[string]*instance{
-					"id-1": {
-						Instance: &ec2.Instance{
-							InstanceId:        aws.String("id-1"),
-							InstanceType:      aws.String("m3.medium"),
-							Placement:         &ec2.Placement{AvailabilityZone: aws.String("eu-west-1a")},
-							InstanceLifecycle: aws.String("spot"),
-						},
-					},
-				},
-			),
-			asgDesiredCapacity: aws.Int64(10),
-			spotInfo:           instanceTypeInformation{instanceType: "m3.medium"},
-			availabilityZone:   aws.String("eu-west-1a"),
-			expected:           true,
-		},
-		{name: "ASG has no instances of this type",
-			asgName: "test-asg",
-			asgInstances: makeInstancesWithCatalog(
-				map[string]*instance{
-					"id-1": {
-						Instance: &ec2.Instance{
-							InstanceId:        aws.String("id-1"),
-							InstanceType:      aws.String("m3.medium"),
-							Placement:         &ec2.Placement{AvailabilityZone: aws.String("eu-west-1a")},
-							InstanceLifecycle: aws.String("spot"),
-						},
-					},
-				},
-			),
-			asgDesiredCapacity: aws.Int64(5),
-			spotInfo:           instanceTypeInformation{instanceType: "t2.micro"},
-			availabilityZone:   aws.String("eu-west-1a"),
-			expected:           true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			a := &autoScalingGroup{
-				name:      tt.name,
-				instances: tt.asgInstances,
-				Group: &autoscaling.Group{
-					DesiredCapacity: tt.asgDesiredCapacity,
-				},
-			}
-			i := &instance{
-				Instance: &ec2.Instance{
-					Placement: &ec2.Placement{
-						AvailabilityZone: tt.availabilityZone,
-					},
-				},
-				asg: a,
-			}
-			retValue := i.isSpotQuantityCompatible(tt.spotInfo)
-			if retValue != tt.expected {
-				t.Errorf("Value received: %t expected %t", retValue, tt.expected)
-			}
-		})
-	}
-}
-
 func TestGetCheapestCompatibleSpotInstanceType(t *testing.T) {
 	tests := []struct {
 		name           string
 		spotInfos      map[string]instanceTypeInformation
 		instanceInfo   *instance
 		asg            *autoScalingGroup
-		lc             *launchConfiguration
 		expectedString string
 		expectedError  error
 		allowedList    []string
+		disallowedList []string
 	}{
 		{name: "better/cheaper spot instance found",
 			spotInfos: map[string]instanceTypeInformation{
@@ -820,18 +734,232 @@ func TestGetCheapestCompatibleSpotInstanceType(t *testing.T) {
 					DesiredCapacity: aws.Int64(4),
 				},
 			},
-			lc: &launchConfiguration{
-				LaunchConfiguration: &autoscaling.LaunchConfiguration{
-					BlockDeviceMappings: []*autoscaling.BlockDeviceMapping{
-						{
-							VirtualName: aws.String("vn1"),
-						},
-						{
-							VirtualName: aws.String("ephemeral"),
+			expectedString: "type1",
+			expectedError:  nil,
+		},
+		{name: "better/cheaper spot instance found but marked as disallowed",
+			spotInfos: map[string]instanceTypeInformation{
+				"1": {
+					instanceType: "type1",
+					pricing: prices{
+						spot: map[string]float64{
+							"eu-central-1": 0.5,
+							"eu-west-1":    1.0,
+							"eu-west-2":    2.0,
 						},
 					},
+					vCPU:   10,
+					memory: 2.5,
+					instanceStoreDeviceCount: 1,
+					instanceStoreDeviceSize:  50.0,
+					instanceStoreIsSSD:       false,
+					virtualizationTypes:      []string{"PV", "else"},
+				},
+				"2": {
+					instanceType: "type2",
+					pricing: prices{
+						spot: map[string]float64{
+							"eu-central-1": 0.8,
+							"eu-west-1":    1.0,
+							"eu-west-2":    2.0,
+						},
+					},
+					vCPU:   10,
+					memory: 2.5,
+					instanceStoreDeviceCount: 1,
+					instanceStoreDeviceSize:  50.0,
+					instanceStoreIsSSD:       false,
+					virtualizationTypes:      []string{"PV", "else"},
 				},
 			},
+			instanceInfo: &instance{
+				Instance: &ec2.Instance{
+					VirtualizationType: aws.String("paravirtual"),
+					Placement: &ec2.Placement{
+						AvailabilityZone: aws.String("eu-central-1"),
+					},
+				},
+				typeInfo: instanceTypeInformation{
+					instanceType: "typeX",
+					vCPU:         10,
+					memory:       2.5,
+					instanceStoreDeviceCount: 1,
+					instanceStoreDeviceSize:  50.0,
+					instanceStoreIsSSD:       false,
+				},
+				price:  0.75,
+				region: &region{},
+			},
+			asg: &autoScalingGroup{
+				name: "test-asg",
+				instances: makeInstancesWithCatalog(
+					map[string]*instance{
+						"id-1": {
+							Instance: &ec2.Instance{
+								InstanceId:        aws.String("id-1"),
+								InstanceType:      aws.String("typeX"),
+								Placement:         &ec2.Placement{AvailabilityZone: aws.String("eu-west-1")},
+								InstanceLifecycle: aws.String("spot"),
+							},
+						},
+					},
+				),
+				Group: &autoscaling.Group{
+					DesiredCapacity: aws.Int64(4),
+				},
+			},
+			disallowedList: []string{"type*"},
+			expectedString: "",
+			expectedError:  errors.New("No cheaper spot instance types could be found"),
+		},
+		{name: "better/cheaper spot instance found but not marked as allowed",
+			spotInfos: map[string]instanceTypeInformation{
+				"1": {
+					instanceType: "type1",
+					pricing: prices{
+						spot: map[string]float64{
+							"eu-central-1": 0.5,
+							"eu-west-1":    1.0,
+							"eu-west-2":    2.0,
+						},
+					},
+					vCPU:   10,
+					memory: 2.5,
+					instanceStoreDeviceCount: 1,
+					instanceStoreDeviceSize:  50.0,
+					instanceStoreIsSSD:       false,
+					virtualizationTypes:      []string{"PV", "else"},
+				},
+				"2": {
+					instanceType: "type2",
+					pricing: prices{
+						spot: map[string]float64{
+							"eu-central-1": 0.8,
+							"eu-west-1":    1.0,
+							"eu-west-2":    2.0,
+						},
+					},
+					vCPU:   10,
+					memory: 2.5,
+					instanceStoreDeviceCount: 1,
+					instanceStoreDeviceSize:  50.0,
+					instanceStoreIsSSD:       false,
+					virtualizationTypes:      []string{"PV", "else"},
+				},
+			},
+			instanceInfo: &instance{
+				Instance: &ec2.Instance{
+					VirtualizationType: aws.String("paravirtual"),
+					Placement: &ec2.Placement{
+						AvailabilityZone: aws.String("eu-central-1"),
+					},
+				},
+				typeInfo: instanceTypeInformation{
+					instanceType: "typeX",
+					vCPU:         10,
+					memory:       2.5,
+					instanceStoreDeviceCount: 1,
+					instanceStoreDeviceSize:  50.0,
+					instanceStoreIsSSD:       false,
+				},
+				price:  0.75,
+				region: &region{},
+			},
+			asg: &autoScalingGroup{
+				name: "test-asg",
+				instances: makeInstancesWithCatalog(
+					map[string]*instance{
+						"id-1": {
+							Instance: &ec2.Instance{
+								InstanceId:        aws.String("id-1"),
+								InstanceType:      aws.String("typeX"),
+								Placement:         &ec2.Placement{AvailabilityZone: aws.String("eu-west-1")},
+								InstanceLifecycle: aws.String("spot"),
+							},
+						},
+					},
+				),
+				Group: &autoscaling.Group{
+					DesiredCapacity: aws.Int64(4),
+				},
+			},
+			allowedList:    []string{"asdf*"},
+			expectedString: "",
+			expectedError:  errors.New("No cheaper spot instance types could be found"),
+		},
+		{name: "better/cheaper spot instance found and marked as allowed",
+			spotInfos: map[string]instanceTypeInformation{
+				"1": {
+					instanceType: "type1",
+					pricing: prices{
+						spot: map[string]float64{
+							"eu-central-1": 0.5,
+							"eu-west-1":    1.0,
+							"eu-west-2":    2.0,
+						},
+					},
+					vCPU:   10,
+					memory: 2.5,
+					instanceStoreDeviceCount: 1,
+					instanceStoreDeviceSize:  50.0,
+					instanceStoreIsSSD:       false,
+					virtualizationTypes:      []string{"PV", "else"},
+				},
+				"2": {
+					instanceType: "type2",
+					pricing: prices{
+						spot: map[string]float64{
+							"eu-central-1": 0.8,
+							"eu-west-1":    1.0,
+							"eu-west-2":    2.0,
+						},
+					},
+					vCPU:   10,
+					memory: 2.5,
+					instanceStoreDeviceCount: 1,
+					instanceStoreDeviceSize:  50.0,
+					instanceStoreIsSSD:       false,
+					virtualizationTypes:      []string{"PV", "else"},
+				},
+			},
+			instanceInfo: &instance{
+				Instance: &ec2.Instance{
+					VirtualizationType: aws.String("paravirtual"),
+					Placement: &ec2.Placement{
+						AvailabilityZone: aws.String("eu-central-1"),
+					},
+				},
+				typeInfo: instanceTypeInformation{
+					instanceType: "typeX",
+					vCPU:         10,
+					memory:       2.5,
+					instanceStoreDeviceCount: 1,
+					instanceStoreDeviceSize:  50.0,
+					instanceStoreIsSSD:       false,
+				},
+				price:  0.75,
+				region: &region{},
+			},
+			asg: &autoScalingGroup{
+				name: "test-asg",
+				instances: makeInstancesWithCatalog(
+					map[string]*instance{
+						"id-1": {
+							Instance: &ec2.Instance{
+								InstanceId:        aws.String("id-1"),
+								InstanceType:      aws.String("typeX"),
+								Placement:         &ec2.Placement{AvailabilityZone: aws.String("eu-west-1")},
+								InstanceLifecycle: aws.String("spot"),
+							},
+						},
+					},
+				),
+				Group: &autoscaling.Group{
+					DesiredCapacity: aws.Int64(4),
+				},
+			},
+
+			allowedList:    []string{"ty*"},
 			expectedString: "type1",
 			expectedError:  nil,
 		},
@@ -906,19 +1034,6 @@ func TestGetCheapestCompatibleSpotInstanceType(t *testing.T) {
 					DesiredCapacity: aws.Int64(4),
 				},
 			},
-			lc: &launchConfiguration{
-				LaunchConfiguration: &autoscaling.LaunchConfiguration{
-					LaunchConfigurationName: aws.String("test"),
-					BlockDeviceMappings: []*autoscaling.BlockDeviceMapping{
-						{
-							VirtualName: aws.String("vn1"),
-						},
-						{
-							VirtualName: aws.String("ephemeral"),
-						},
-					},
-				},
-			},
 			expectedString: "",
 			expectedError:  errors.New("No cheaper spot instance types could be found"),
 		},
@@ -930,17 +1045,77 @@ func TestGetCheapestCompatibleSpotInstanceType(t *testing.T) {
 			i.region.instanceTypeInformation = tt.spotInfos
 			i.asg = tt.asg
 			allowedList := tt.allowedList
-			retValue, err := i.getCheapestCompatibleSpotInstanceType(allowedList)
+			disallowedList := tt.disallowedList
+			retValue, err := i.getCheapestCompatibleSpotInstanceType(allowedList, disallowedList)
 			if err == nil && tt.expectedError != err {
 				t.Errorf("Error received: %v expected %v", err, tt.expectedError.Error())
 			} else if err != nil && tt.expectedError == nil {
 				t.Errorf("Error received: %s expected %s", err.Error(), tt.expectedError)
 			} else if err != nil && tt.expectedError != nil && err.Error() != tt.expectedError.Error() {
 				t.Errorf("Error received: %s expected %s", err.Error(), tt.expectedError.Error())
-			} else if retValue != tt.expectedString {
-				t.Errorf("Value received: %s expected %s", retValue, tt.expectedString)
+			} else if retValue.instanceType != tt.expectedString {
+				t.Errorf("Value received: %s expected %s", retValue.instanceType, tt.expectedString)
 			}
 		})
+	}
+}
+
+func TestGetPricetoBid(t *testing.T) {
+	tests := []struct {
+		spotPercentage       float64
+		currentSpotPrice     float64
+		currentOnDemandPrice float64
+		policy               string
+		want                 float64
+	}{
+		{
+			spotPercentage:       50.0,
+			currentSpotPrice:     0.0216,
+			currentOnDemandPrice: 0.0464,
+			policy:               "aggressive",
+			want:                 0.0324,
+		},
+		{
+			spotPercentage:       79.0,
+			currentSpotPrice:     0.0216,
+			currentOnDemandPrice: 0.0464,
+			policy:               "aggressive",
+			want:                 0.038664,
+		},
+		{
+			spotPercentage:       79.0,
+			currentSpotPrice:     0.0216,
+			currentOnDemandPrice: 0.0464,
+			policy:               "normal",
+			want:                 0.0464,
+		},
+		{
+			spotPercentage:       200.0,
+			currentSpotPrice:     0.0216,
+			currentOnDemandPrice: 0.0464,
+			policy:               "aggressive",
+			want:                 0.0464,
+		},
+	}
+	for _, tt := range tests {
+		cfg := &Config{
+			SpotPriceBufferPercentage: tt.spotPercentage,
+			BiddingPolicy:             tt.policy,
+		}
+		i := &instance{
+			region: &region{
+				name: "us-east-1",
+				conf: cfg,
+			},
+		}
+
+		currentSpotPrice := tt.currentSpotPrice
+		currentOnDemandPrice := tt.currentOnDemandPrice
+		actualPrice := i.getPricetoBid(currentOnDemandPrice, currentSpotPrice)
+		if math.Abs(actualPrice-tt.want) > 0.000001 {
+			t.Errorf("percentage = %.2f, policy = %s, expected price = %.5f, want %.5f, currentSpotPrice = %.5f",
+				tt.spotPercentage, tt.policy, actualPrice, tt.want, currentSpotPrice)
+		}
 	}
 }
 
@@ -957,6 +1132,9 @@ func TestTerminate(t *testing.T) {
 			inst: &instance{
 				Instance: &ec2.Instance{
 					InstanceId: aws.String("id1"),
+					State: &ec2.InstanceState{
+						Name: aws.String(ec2.InstanceStateNameRunning),
+					},
 				},
 				region: &region{
 					services: connections{
@@ -974,6 +1152,9 @@ func TestTerminate(t *testing.T) {
 			inst: &instance{
 				Instance: &ec2.Instance{
 					InstanceId: aws.String("id1"),
+					State: &ec2.InstanceState{
+						Name: aws.String(ec2.InstanceStateNameRunning),
+					},
 				},
 				region: &region{
 					services: connections{
@@ -991,106 +1172,6 @@ func TestTerminate(t *testing.T) {
 		if ret != nil && ret.Error() != tt.expected.Error() {
 			t.Errorf("error actual: %s, expected: %s", ret.Error(), tt.expected.Error())
 		}
-	}
-}
-
-// Ideally should find a better way to test tagging
-// and avoid having a small wait of 1 timeout
-func TestTag(t *testing.T) {
-
-	tests := []struct {
-		name          string
-		tags          []*ec2.Tag
-		inst          *instance
-		expectedError error
-	}{
-		{
-			name: "no tags without error",
-			tags: []*ec2.Tag{},
-			inst: &instance{
-				Instance: &ec2.Instance{
-					InstanceId: aws.String("id1"),
-				},
-				region: &region{
-					name: "test",
-					conf: &Config{},
-					services: connections{
-						ec2: mockEC2{
-							cterr: nil,
-						},
-					},
-				},
-			},
-			expectedError: nil,
-		},
-		{
-			name: "no tags with error",
-			tags: []*ec2.Tag{},
-			inst: &instance{
-				Instance: &ec2.Instance{
-					InstanceId: aws.String("id1"),
-				},
-				region: &region{
-					name: "test",
-					conf: &Config{},
-					services: connections{
-						ec2: mockEC2{
-							cterr: errors.New("no tags with error"),
-						},
-					},
-				},
-			},
-			expectedError: errors.New("no tags with error"),
-		},
-		{
-			name: "tags without error",
-			tags: []*ec2.Tag{
-				{Key: aws.String("proj"), Value: aws.String("test")},
-				{Key: aws.String("x"), Value: aws.String("3")},
-			},
-			inst: &instance{
-				Instance: &ec2.Instance{
-					InstanceId: aws.String("id1"),
-				},
-				region: &region{
-					name: "test",
-					conf: &Config{},
-					services: connections{
-						ec2: mockEC2{
-							cterr: nil,
-						},
-					},
-				},
-			},
-			expectedError: nil,
-		},
-		{
-			name: "tags with error",
-			tags: []*ec2.Tag{
-				{Key: aws.String("proj"), Value: aws.String("test")},
-				{Key: aws.String("x"), Value: aws.String("3")},
-			},
-			inst: &instance{
-				Instance: &ec2.Instance{
-					InstanceId: aws.String("id1"),
-				},
-				region: &region{
-					name: "test",
-					conf: &Config{},
-					services: connections{
-						ec2: mockEC2{
-							cterr: errors.New("tags with error"),
-						},
-					},
-				},
-			},
-			expectedError: errors.New("tags with error"),
-		},
-	}
-
-	for _, tt := range tests {
-		err := tt.inst.tag(tt.tags, 1)
-		CheckErrors(t, err, tt.expectedError)
 	}
 }
 
@@ -1117,6 +1198,738 @@ func TestMin(t *testing.T) {
 			retValue := min(tt.x, tt.y)
 			if retValue != tt.expected {
 				t.Errorf("Value received: %d expected %d", retValue, tt.expected)
+			}
+		})
+	}
+}
+
+func TestGenerateTagList(t *testing.T) {
+	tests := []struct {
+		name                     string
+		ASGName                  string
+		ASGLCName                string
+		instanceTags             []*ec2.Tag
+		expectedTagSpecification []*ec2.TagSpecification
+	}{
+		{name: "no tags on original instance",
+			ASGLCName:    "testLC0",
+			ASGName:      "myASG",
+			instanceTags: []*ec2.Tag{},
+			expectedTagSpecification: []*ec2.TagSpecification{
+				{
+					ResourceType: aws.String("instance"),
+					Tags: []*ec2.Tag{
+						{
+							Key:   aws.String("LaunchConfigurationName"),
+							Value: aws.String("testLC0"),
+						},
+						{
+							Key:   aws.String("launched-by-autospotting"),
+							Value: aws.String("true"),
+						},
+						{
+							Key:   aws.String("launched-for-asg"),
+							Value: aws.String("myASG"),
+						},
+					},
+				},
+			},
+		},
+		{name: "Multiple tags on original instance",
+			ASGLCName: "testLC0",
+			ASGName:   "myASG",
+			instanceTags: []*ec2.Tag{
+				{
+					Key:   aws.String("foo"),
+					Value: aws.String("bar"),
+				},
+				{
+					Key:   aws.String("baz"),
+					Value: aws.String("bazinga"),
+				},
+			},
+			expectedTagSpecification: []*ec2.TagSpecification{
+				{
+					ResourceType: aws.String("instance"),
+					Tags: []*ec2.Tag{
+						{
+							Key:   aws.String("LaunchConfigurationName"),
+							Value: aws.String("testLC0"),
+						},
+						{
+							Key:   aws.String("launched-by-autospotting"),
+							Value: aws.String("true"),
+						},
+						{
+							Key:   aws.String("launched-for-asg"),
+							Value: aws.String("myASG"),
+						},
+						{
+							Key:   aws.String("foo"),
+							Value: aws.String("bar"),
+						},
+						{
+							Key:   aws.String("baz"),
+							Value: aws.String("bazinga"),
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+
+			i := instance{
+				Instance: &ec2.Instance{
+					Tags: tt.instanceTags,
+				},
+				asg: &autoScalingGroup{
+					name: tt.ASGName,
+					Group: &autoscaling.Group{
+						LaunchConfigurationName: aws.String(tt.ASGLCName),
+					},
+				},
+			}
+
+			tags := i.generateTagsList()
+			if !reflect.DeepEqual(tags, tt.expectedTagSpecification) {
+				t.Errorf("propagatedInstanceTags received: %+v, expected: %+v",
+					tags, tt.expectedTagSpecification)
+			}
+		})
+	}
+}
+
+func Test_instance_convertBlockDeviceMappings(t *testing.T) {
+
+	tests := []struct {
+		name string
+		lc   *launchConfiguration
+		want []*ec2.BlockDeviceMapping
+	}{
+		{
+			name: "nil launch configuration",
+			lc:   nil,
+			want: []*ec2.BlockDeviceMapping{},
+		}, {
+			name: "nil block device mapping",
+			lc: &launchConfiguration{
+				LaunchConfiguration: &autoscaling.LaunchConfiguration{
+					BlockDeviceMappings: nil,
+				},
+			},
+			want: []*ec2.BlockDeviceMapping{},
+		},
+		{
+			name: "instance-store only",
+			lc: &launchConfiguration{
+				LaunchConfiguration: &autoscaling.LaunchConfiguration{
+					BlockDeviceMappings: []*autoscaling.BlockDeviceMapping{
+						{
+							DeviceName:  aws.String("/dev/ephemeral0"),
+							Ebs:         nil,
+							NoDevice:    aws.Bool(false),
+							VirtualName: aws.String("foo"),
+						},
+						{
+							DeviceName:  aws.String("/dev/ephemeral1"),
+							Ebs:         nil,
+							NoDevice:    aws.Bool(false),
+							VirtualName: aws.String("bar"),
+						},
+					},
+				},
+			},
+			want: []*ec2.BlockDeviceMapping{
+				{
+					DeviceName:  aws.String("/dev/ephemeral0"),
+					Ebs:         nil,
+					NoDevice:    aws.String("false"),
+					VirtualName: aws.String("foo"),
+				},
+				{
+					DeviceName:  aws.String("/dev/ephemeral1"),
+					Ebs:         nil,
+					NoDevice:    aws.String("false"),
+					VirtualName: aws.String("bar"),
+				},
+			},
+		},
+
+		{
+			name: "instance-store and EBS",
+			lc: &launchConfiguration{
+				LaunchConfiguration: &autoscaling.LaunchConfiguration{
+					BlockDeviceMappings: []*autoscaling.BlockDeviceMapping{
+						{
+							DeviceName:  aws.String("/dev/ephemeral0"),
+							Ebs:         nil,
+							NoDevice:    aws.Bool(false),
+							VirtualName: aws.String("foo"),
+						},
+						{
+							DeviceName: aws.String("/dev/xvda"),
+							Ebs: &autoscaling.Ebs{
+								DeleteOnTermination: aws.Bool(false),
+								VolumeSize:          aws.Int64(10),
+							},
+							VirtualName: aws.String("bar"),
+						},
+						{
+							DeviceName: aws.String("/dev/xvdb"),
+							Ebs: &autoscaling.Ebs{
+								DeleteOnTermination: aws.Bool(true),
+								VolumeSize:          aws.Int64(20),
+							},
+							VirtualName: aws.String("baz"),
+						},
+					},
+				},
+			},
+			want: []*ec2.BlockDeviceMapping{
+				{
+					DeviceName:  aws.String("/dev/ephemeral0"),
+					Ebs:         nil,
+					NoDevice:    aws.String("false"),
+					VirtualName: aws.String("foo"),
+				},
+				{
+					DeviceName: aws.String("/dev/xvda"),
+					Ebs: &ec2.EbsBlockDevice{
+						DeleteOnTermination: aws.Bool(false),
+						VolumeSize:          aws.Int64(10),
+					},
+					VirtualName: aws.String("bar"),
+				},
+				{
+					DeviceName: aws.String("/dev/xvdb"),
+					Ebs: &ec2.EbsBlockDevice{
+						DeleteOnTermination: aws.Bool(true),
+						VolumeSize:          aws.Int64(20),
+					},
+					VirtualName: aws.String("baz"),
+				},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			i := &instance{}
+			if got := i.convertBlockDeviceMappings(tt.lc); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("instance.convertBlockDeviceMappings() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_instance_convertSecurityGroups(t *testing.T) {
+
+	tests := []struct {
+		name string
+		inst instance
+		want []*string
+	}{
+		{
+			name: "missing SGs",
+			inst: instance{
+				Instance: &ec2.Instance{
+					SecurityGroups: []*ec2.GroupIdentifier{},
+				},
+			},
+			want: []*string{},
+		},
+		{
+			name: "single SG",
+			inst: instance{
+				Instance: &ec2.Instance{
+					SecurityGroups: []*ec2.GroupIdentifier{{
+						GroupId:   aws.String("sg-123"),
+						GroupName: aws.String("foo"),
+					}},
+				},
+			},
+			want: []*string{aws.String("sg-123")},
+		},
+		{
+			name: "multiple SGs",
+			inst: instance{
+				Instance: &ec2.Instance{
+					SecurityGroups: []*ec2.GroupIdentifier{{
+						GroupId:   aws.String("sg-123"),
+						GroupName: aws.String("foo"),
+					},
+						{
+							GroupId:   aws.String("sg-456"),
+							GroupName: aws.String("bar"),
+						},
+					},
+				},
+			},
+			want: []*string{aws.String("sg-123"), aws.String("sg-456")},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.inst.convertSecurityGroups(); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("instance.convertSecurityGroups() = %v, want %v",
+					spew.Sdump(got), spew.Sdump(tt.want))
+			}
+		})
+	}
+}
+
+func Test_instance_createRunInstancesInput(t *testing.T) {
+
+	type args struct {
+		instanceType string
+		price        float64
+	}
+	tests := []struct {
+		name string
+		inst instance
+		args args
+		want *ec2.RunInstancesInput
+	}{
+		{
+			name: "create run instances input without launch-configuration",
+			inst: instance{
+				asg: &autoScalingGroup{
+					name: "mygroup",
+					Group: &autoscaling.Group{
+						LaunchConfigurationName: aws.String("myLC"),
+						LaunchTemplate: &autoscaling.LaunchTemplateSpecification{
+							LaunchTemplateId:   aws.String("lt-id"),
+							LaunchTemplateName: aws.String("lt-name"),
+						},
+					},
+					launchConfiguration: nil,
+				},
+				Instance: &ec2.Instance{
+					EbsOptimized: aws.Bool(true),
+
+					IamInstanceProfile: &ec2.IamInstanceProfile{
+						Arn: aws.String("profile-arn"),
+					},
+
+					ImageId:      aws.String("ami-123"),
+					InstanceType: aws.String("t2.medium"),
+					KeyName:      aws.String("mykey"),
+
+					Placement: &ec2.Placement{
+						Affinity: aws.String("foo"),
+					},
+
+					SecurityGroups: []*ec2.GroupIdentifier{
+						{
+							GroupName: aws.String("foo"),
+							GroupId:   aws.String("sg-123"),
+						},
+						{
+							GroupName: aws.String("bar"),
+							GroupId:   aws.String("sg-456"),
+						},
+					},
+
+					SubnetId: aws.String("subnet-123"),
+				},
+			}, args: args{
+				instanceType: "t2.small",
+				price:        1.5,
+			},
+			want: &ec2.RunInstancesInput{
+
+				EbsOptimized: aws.Bool(true),
+
+				IamInstanceProfile: &ec2.IamInstanceProfileSpecification{
+					Arn: aws.String("profile-arn"),
+				},
+
+				ImageId: aws.String("ami-123"),
+
+				InstanceMarketOptions: &ec2.InstanceMarketOptionsRequest{
+					MarketType: aws.String("spot"),
+					SpotOptions: &ec2.SpotMarketOptions{
+						MaxPrice: aws.String("1.5"),
+					},
+				},
+
+				InstanceType: aws.String("t2.small"),
+				KeyName:      aws.String("mykey"),
+
+				LaunchTemplate: &ec2.LaunchTemplateSpecification{
+					LaunchTemplateId:   aws.String("lt-id"),
+					LaunchTemplateName: aws.String("lt-name"),
+				},
+
+				MaxCount: aws.Int64(1),
+				MinCount: aws.Int64(1),
+
+				Placement: &ec2.Placement{
+					Affinity: aws.String("foo"),
+				},
+
+				SecurityGroupIds: []*string{
+					aws.String("sg-123"),
+					aws.String("sg-456"),
+				},
+
+				SubnetId: aws.String("subnet-123"),
+
+				TagSpecifications: []*ec2.TagSpecification{{
+					ResourceType: aws.String("instance"),
+					Tags: []*ec2.Tag{
+						{
+							Key:   aws.String("LaunchConfigurationName"),
+							Value: aws.String("myLC"),
+						},
+						{
+							Key:   aws.String("launched-by-autospotting"),
+							Value: aws.String("true"),
+						},
+						{
+							Key:   aws.String("launched-for-asg"),
+							Value: aws.String("mygroup"),
+						},
+					},
+				},
+				},
+			},
+		},
+		{
+			name: "create run instances input with simple LC",
+			inst: instance{
+				asg: &autoScalingGroup{
+					name: "mygroup",
+					Group: &autoscaling.Group{
+						LaunchConfigurationName: aws.String("myLC"),
+						LaunchTemplate: &autoscaling.LaunchTemplateSpecification{
+							LaunchTemplateId:   aws.String("lt-id"),
+							LaunchTemplateName: aws.String("lt-name"),
+						},
+					},
+					launchConfiguration: &launchConfiguration{
+						LaunchConfiguration: &autoscaling.LaunchConfiguration{
+							BlockDeviceMappings:      nil,
+							InstanceMonitoring:       nil,
+							UserData:                 aws.String("userdata"),
+							AssociatePublicIpAddress: nil,
+						},
+					},
+				},
+				Instance: &ec2.Instance{
+					EbsOptimized: aws.Bool(true),
+
+					IamInstanceProfile: &ec2.IamInstanceProfile{
+						Arn: aws.String("profile-arn"),
+					},
+
+					ImageId:      aws.String("ami-123"),
+					InstanceType: aws.String("t2.medium"),
+					KeyName:      aws.String("mykey"),
+
+					Placement: &ec2.Placement{
+						Affinity: aws.String("foo"),
+					},
+
+					SecurityGroups: []*ec2.GroupIdentifier{
+						{
+							GroupName: aws.String("foo"),
+							GroupId:   aws.String("sg-123"),
+						},
+						{
+							GroupName: aws.String("bar"),
+							GroupId:   aws.String("sg-456"),
+						},
+					},
+
+					SubnetId: nil,
+				},
+			}, args: args{
+				instanceType: "t2.small",
+				price:        1.5,
+			},
+			want: &ec2.RunInstancesInput{
+
+				EbsOptimized: aws.Bool(true),
+
+				IamInstanceProfile: &ec2.IamInstanceProfileSpecification{
+					Arn: aws.String("profile-arn"),
+				},
+
+				ImageId: aws.String("ami-123"),
+
+				InstanceMarketOptions: &ec2.InstanceMarketOptionsRequest{
+					MarketType: aws.String("spot"),
+					SpotOptions: &ec2.SpotMarketOptions{
+						MaxPrice: aws.String("1.5"),
+					},
+				},
+
+				InstanceType: aws.String("t2.small"),
+				KeyName:      aws.String("mykey"),
+
+				LaunchTemplate: &ec2.LaunchTemplateSpecification{
+					LaunchTemplateId:   aws.String("lt-id"),
+					LaunchTemplateName: aws.String("lt-name"),
+				},
+
+				MaxCount: aws.Int64(1),
+				MinCount: aws.Int64(1),
+
+				Placement: &ec2.Placement{
+					Affinity: aws.String("foo"),
+				},
+
+				SecurityGroupIds: []*string{
+					aws.String("sg-123"),
+					aws.String("sg-456"),
+				},
+
+				SubnetId: nil,
+
+				TagSpecifications: []*ec2.TagSpecification{{
+					ResourceType: aws.String("instance"),
+					Tags: []*ec2.Tag{
+						{
+							Key:   aws.String("LaunchConfigurationName"),
+							Value: aws.String("myLC"),
+						},
+						{
+							Key:   aws.String("launched-by-autospotting"),
+							Value: aws.String("true"),
+						},
+						{
+							Key:   aws.String("launched-for-asg"),
+							Value: aws.String("mygroup"),
+						},
+					},
+				},
+				},
+				UserData: aws.String("userdata"),
+			},
+		},
+
+		{
+			name: "create run instances input with full launch configuration",
+			inst: instance{
+				asg: &autoScalingGroup{
+					name: "mygroup",
+					Group: &autoscaling.Group{
+						LaunchConfigurationName: aws.String("myLC"),
+						LaunchTemplate: &autoscaling.LaunchTemplateSpecification{
+							LaunchTemplateId:   aws.String("lt-id"),
+							LaunchTemplateName: aws.String("lt-name"),
+						},
+					},
+					launchConfiguration: &launchConfiguration{
+						LaunchConfiguration: &autoscaling.LaunchConfiguration{
+							InstanceMonitoring: &autoscaling.InstanceMonitoring{
+								Enabled: aws.Bool(true),
+							},
+
+							BlockDeviceMappings: []*autoscaling.BlockDeviceMapping{
+								{
+									DeviceName: aws.String("foo"),
+								},
+							},
+							AssociatePublicIpAddress: aws.Bool(true),
+							UserData:                 aws.String("userdata"),
+						},
+					},
+				},
+				Instance: &ec2.Instance{
+					EbsOptimized: aws.Bool(true),
+
+					IamInstanceProfile: &ec2.IamInstanceProfile{
+						Arn: aws.String("profile-arn"),
+					},
+
+					ImageId:      aws.String("ami-123"),
+					InstanceType: aws.String("t2.medium"),
+					KeyName:      aws.String("mykey"),
+
+					Placement: &ec2.Placement{
+						Affinity: aws.String("foo"),
+					},
+
+					SecurityGroups: []*ec2.GroupIdentifier{
+						{
+							GroupName: aws.String("foo"),
+							GroupId:   aws.String("sg-123"),
+						},
+						{
+							GroupName: aws.String("bar"),
+							GroupId:   aws.String("sg-456"),
+						},
+					},
+
+					SubnetId: aws.String("subnet-123"),
+				},
+			}, args: args{
+				instanceType: "t2.small",
+				price:        1.5,
+			},
+			want: &ec2.RunInstancesInput{
+				BlockDeviceMappings: []*ec2.BlockDeviceMapping{
+					{
+						DeviceName: aws.String("foo"),
+					},
+				},
+
+				EbsOptimized: aws.Bool(true),
+
+				IamInstanceProfile: &ec2.IamInstanceProfileSpecification{
+					Arn: aws.String("profile-arn"),
+				},
+
+				ImageId: aws.String("ami-123"),
+
+				InstanceMarketOptions: &ec2.InstanceMarketOptionsRequest{
+					MarketType: aws.String("spot"),
+					SpotOptions: &ec2.SpotMarketOptions{
+						MaxPrice: aws.String("1.5"),
+					},
+				},
+
+				InstanceType: aws.String("t2.small"),
+				KeyName:      aws.String("mykey"),
+
+				LaunchTemplate: &ec2.LaunchTemplateSpecification{
+					LaunchTemplateId:   aws.String("lt-id"),
+					LaunchTemplateName: aws.String("lt-name"),
+				},
+
+				MaxCount: aws.Int64(1),
+				MinCount: aws.Int64(1),
+
+				Monitoring: &ec2.RunInstancesMonitoringEnabled{
+					Enabled: aws.Bool(true),
+				},
+
+				Placement: &ec2.Placement{
+					Affinity: aws.String("foo"),
+				},
+
+				NetworkInterfaces: []*ec2.InstanceNetworkInterfaceSpecification{
+					{
+						AssociatePublicIpAddress: aws.Bool(true),
+						DeviceIndex:              aws.Int64(0),
+						SubnetId:                 aws.String("subnet-123"),
+						Groups: []*string{
+							aws.String("sg-123"),
+							aws.String("sg-456"),
+						},
+					},
+				},
+
+				TagSpecifications: []*ec2.TagSpecification{{
+					ResourceType: aws.String("instance"),
+					Tags: []*ec2.Tag{
+						{
+							Key:   aws.String("LaunchConfigurationName"),
+							Value: aws.String("myLC"),
+						},
+						{
+							Key:   aws.String("launched-by-autospotting"),
+							Value: aws.String("true"),
+						},
+						{
+							Key:   aws.String("launched-for-asg"),
+							Value: aws.String("mygroup"),
+						},
+					},
+				},
+				},
+				UserData: aws.String("userdata"),
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+
+			if got := tt.inst.createRunInstancesInput(tt.args.instanceType, tt.args.price); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("instance.createRunInstancesInput() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_instance_isReadyToAttach(t *testing.T) {
+	//now := time.Now()
+	tenMinutesAgo := time.Now().Add(-10 * time.Minute)
+
+	tests := []struct {
+		name     string
+		instance instance
+		asg      *autoScalingGroup
+		want     bool
+	}{
+
+		{
+			name: "pending instance",
+			instance: instance{
+				Instance: &ec2.Instance{
+					InstanceId: aws.String("i-123"),
+					LaunchTime: &tenMinutesAgo,
+					State: &ec2.InstanceState{
+						Name: aws.String(ec2.InstanceStateNamePending),
+					},
+				},
+			},
+			asg: &autoScalingGroup{
+				name: "my-asg",
+				Group: &autoscaling.Group{
+					HealthCheckGracePeriod: aws.Int64(3600),
+				},
+			},
+			want: false,
+		},
+		{
+			name: "not-ready running instance",
+			instance: instance{
+				Instance: &ec2.Instance{
+					InstanceId: aws.String("i-123"),
+					LaunchTime: &tenMinutesAgo,
+					State: &ec2.InstanceState{
+						Name: aws.String(ec2.InstanceStateNameRunning),
+					},
+				},
+			},
+			asg: &autoScalingGroup{
+				name: "my-asg",
+				Group: &autoscaling.Group{
+					HealthCheckGracePeriod: aws.Int64(3600),
+				},
+			},
+			want: false,
+		},
+		{
+			name: "ready running instance",
+			instance: instance{
+				Instance: &ec2.Instance{
+					InstanceId: aws.String("i-123"),
+					LaunchTime: &tenMinutesAgo,
+					State: &ec2.InstanceState{
+						Name: aws.String(ec2.InstanceStateNameRunning),
+					},
+				},
+			},
+			asg: &autoScalingGroup{
+				name: "my-asg",
+				Group: &autoscaling.Group{
+					HealthCheckGracePeriod: aws.Int64(300),
+				},
+			},
+			want: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+
+			if got := tt.instance.isReadyToAttach(tt.asg); got != tt.want {
+				t.Errorf("instance.isReadyToAttach() = %v, want %v", got, tt.want)
 			}
 		})
 	}

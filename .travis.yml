@@ -8,7 +8,14 @@ sudo: required
 services:
 - docker
 
-script: make travisci
+env:
+  # options: nightly, custom, stable
+  # default: custom
+  - FLAVOR=nightly
+
+script:
+    - make travisci
+    - make terraform-test
 
 after_success:
   - curl --request POST "https://goreportcard.com/checks" --data "repo=github.com/cristim/autospotting"

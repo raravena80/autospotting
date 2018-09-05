@@ -39,7 +39,6 @@ Gitter and should only be cleared after the PR is merged.
 The code review should be largely a matter of going through this checklist.
 -->
 
-
 1. [ ] The contribution fixes a single existing github issue, and it is linked
    to it.
 1. [ ] The code is as simple as possible, readable and follows the idiomatic Go
@@ -50,7 +49,7 @@ The code review should be largely a matter of going through this checklist.
 1. [ ] Functionality not applicable to all users should be configurable.
 1. [ ] Configurations should be exposed through Lambda function environment
    variables which are also passed as parameters to the
-   [CloudFormation](https://github.com/cristim/autospotting/blob/master/cloudformation/stacks/AutoSpotting/template.json)
+   [CloudFormation](https://github.com/cristim/autospotting/blob/master/cloudformation/stacks/AutoSpotting/template.yaml)
    and
    [Terraform](https://github.com/cristim/autospotting/blob/master/terraform/autospotting.tf)
    stacks defined as infrastructure code.
